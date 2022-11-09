@@ -63,6 +63,17 @@ type ApplyCommand struct {
 	Command interface{}
 }
 
+const Follower = 1
+const Candidate = 2
+const Leader = 3
+
+type logEntry struct {
+	term      int
+	logs      []int
+	lastIndex int
+	command   interface{}
+}
+
 //
 // Raft struct
 // ===========
@@ -81,7 +92,18 @@ type Raft struct {
 	// Your data here (2A, 2B).
 	// Look at the Raft paper's Figure 2 for a description of what
 	// state a Raft peer should maintain
+	term        int
+	status      int
+	votedFor    int
+	logs        map[int]logEntry
+	commitIndex int // index of highest log entry known to be committed
+	lastApplied int // index of highest log entry applied to state machine
+	nextIndex   []int
+	matchIndex  []int
 
+	applyCh      chan ApplyCommand
+	electTimeOut chan bool
+	heartbeat    chan *ApplyCommand
 }
 
 //
@@ -96,6 +118,14 @@ func (rf *Raft) GetState() (int, int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A)
+
+	me = rf.me
+	term = rf.term
+	if rf.status == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return me, term, isleader
 }
 
@@ -111,6 +141,11 @@ func (rf *Raft) GetState() (int, int, bool) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B)
+	Term         int // candidate’s term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm  int // term of candidate’s last log entry
+
 }
 
 //
@@ -126,6 +161,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A)
+	Term        int  // currentTerm, for candidate to update itself
+	voteGranted bool // true means candidate received vote
 }
 
 //
@@ -136,6 +173,25 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B)
+	rf.mux.Lock()
+
+	if args.Term < rf.term {
+		reply.voteGranted = false
+	} else {
+		if args.Term > rf.term {
+			rf.term = args.Term
+		}
+
+		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+			reply.voteGranted = true
+			rf.votedFor = args.CandidateId
+		} else {
+			reply.voteGranted = false
+		}
+	}
+
+	reply.Term = rf.term
+	rf.mux.Unlock()
 }
 
 //
@@ -283,6 +339,7 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 	}
 
 	// Your initialization code here (2A, 2B)
+	rf.applyCh = applyCh
 
 	return rf
 }
