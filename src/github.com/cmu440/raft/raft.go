@@ -44,10 +44,10 @@ import (
 
 // Set to false to disable debug logs completely
 // Make sure to set kEnableDebugLogs to false before submitting
-const kEnableDebugLogs = true
+const kEnableDebugLogs = false
 
 // Set to true to log to stdout instead of file
-const kLogToStdout = true
+const kLogToStdout = false
 
 // Change this to output logs to a different directory
 const kLogOutputDir = "./raftlogs/"
@@ -117,6 +117,8 @@ type Raft struct {
 // believes it is the leader
 //
 func (rf *Raft) GetState() (int, int, bool) {
+	rf.mux.Lock()
+	defer rf.mux.Unlock()
 	var me int
 	var term int
 	var isleader bool
@@ -402,16 +404,16 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 
 func (rf *Raft) mainRoutine() {
 	for {
-		randTime := rand.Intn(800-300) + 300
+		randTime := rand.Intn(500-300) + 300
 		electTimeOut := time.NewTimer(time.Duration(randTime) * time.Millisecond)
-		rf.logger.Println("Term:", rf.term, "timeout", randTime)
+		// rf.logger.Println("Term:", rf.term, "timeout", randTime)
 
 		select {
 		case <-electTimeOut.C: // The current election timeout
 			electTimeOut.Stop()
 
 			rf.mux.Lock()
-			rf.logger.Println("Term:", rf.term, "Status:", rf.status, "Current election timeout")
+			rf.logger.Println("Term:", rf.term, "Status:", rf.status, "Num", len(rf.peers), "Current election timeout")
 			if rf.status == Candidate && rf.term != 0 {
 				// election timeout elapses: start new election
 				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Start new election")
@@ -486,7 +488,7 @@ func (rf *Raft) electionRoutine() {
 			}
 
 			// if satisfied majority vote, convert to leader and return
-			if count > majority {
+			if count >= majority {
 				rf.mux.Lock()
 				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Get majority")
 				rf.beVoted <- true
