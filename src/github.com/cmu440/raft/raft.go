@@ -44,10 +44,10 @@ import (
 
 // Set to false to disable debug logs completely
 // Make sure to set kEnableDebugLogs to false before submitting
-const kEnableDebugLogs = false
+const kEnableDebugLogs = true
 
 // Set to true to log to stdout instead of file
-const kLogToStdout = false
+const kLogToStdout = true
 
 // Change this to output logs to a different directory
 const kLogOutputDir = "./raftlogs/"
@@ -240,7 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // not the struct itself
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	return ok
 }
 
@@ -263,7 +263,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mux.Lock()
 	defer rf.mux.Unlock()
 
-	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	// heartbeat
 	if args.Entries == 0 {
 		reply.Term = rf.term
 		reply.Success = true
@@ -281,11 +281,118 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, &reply)
 	return ok
 }
 
 // AppendEntries RPC Ends
+
+func (rf *Raft) sendRequestVoteRoutine(
+	server int, args *RequestVoteArgs, reply *RequestVoteReply, replies chan *RequestVoteReply) {
+	rf.sendRequestVote(server, args, reply)
+	replies <- reply // send reply through channel
+}
+
+func (rf *Raft) electionRoutine() {
+	rf.mux.Lock()
+	rf.logger.Println("Enter election")
+	args := &RequestVoteArgs{
+		rf.term,
+		rf.me,
+	}
+	rf.mux.Unlock()
+
+	// send initial empty AppendEntries RPCs (heartbeat) to each server;
+	// repeat during idle periods to prevent election timeouts
+	count := 1
+	replies := make(chan *RequestVoteReply, len(rf.peers))
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer != rf.me {
+			var reply RequestVoteReply
+			go rf.sendRequestVoteRoutine(peer, args, &reply, replies)
+		}
+	}
+
+	majority := len(rf.peers) / 2
+	for {
+		select {
+		case <-rf.electTimeOut: // election timeout, just stop this routine
+			// rf.logger.Println("Gather vote done but timeout")
+
+			return
+		case reply := <-replies: // gather replies from other servers
+			rf.mux.Lock()
+			currentTerm := rf.term
+			rf.mux.Unlock()
+
+			if reply.Term > currentTerm { // term mismatch, convert to follower and return
+				rf.mux.Lock()
+				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Convert to follower")
+				rf.status = Follower
+				rf.votedFor = -1
+				rf.term = reply.Term
+				rf.mux.Unlock()
+				return
+			}
+
+			// update vote counts
+			if reply.VoteGranted {
+				count += 1
+			}
+			rf.logger.Println("Enter replies, count:", count, "majority:", majority)
+
+			// if satisfied majority vote, convert to leader and return
+			if count > majority {
+				rf.mux.Lock()
+				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Get majority")
+				rf.beVoted <- true
+				rf.mux.Unlock()
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) leaderRoutine() {
+	rf.mux.Lock()
+	args := &AppendEntriesArgs{
+		rf.term,
+		rf.me,
+		0,
+	}
+	rf.mux.Unlock()
+
+	for {
+		select {
+		case <-rf.appendEntries:
+			rf.mux.Lock()
+			// rf.votedFor = -1
+			rf.logger.Println("Term", rf.term, "Status:", rf.status, "Id", rf.me, "Response heartbeat")
+			// if (rf.status == Leader || rf.status == Candidate) && appendEntry.Term >= rf.term {
+			// 	// AppendEntries RPC received from new leader: convert to follower
+			// 	rf.logger.Println("Term", rf.term, "Status:", rf.status, "Convert to follower")
+			// 	rf.status = Follower
+			// 	rf.electTimeOut <- true
+			// }
+
+			// if appendEntry.Term > rf.term {
+			// 	rf.term = appendEntry.Term
+			// }
+			rf.mux.Unlock()
+			return
+		default:
+			rf.logger.Println("Term", rf.term, "Status:", rf.status, "Id", rf.me, "Send heartbeat")
+			for peer := 0; peer < len(rf.peers); peer++ {
+				if peer != rf.me {
+					var reply AppendEntriesReply
+					go rf.sendAppendEntries(peer, args, &reply)
+				}
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
 
 //
 // PutCommand
@@ -404,19 +511,25 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 
 func (rf *Raft) mainRoutine() {
 	for {
-		randTime := rand.Intn(500-300) + 300
+		randTime := rand.Intn(300) + 500
 		electTimeOut := time.NewTimer(time.Duration(randTime) * time.Millisecond)
-		// rf.logger.Println("Term:", rf.term, "timeout", randTime)
+		rf.mux.Lock()
+		rf.logger.Println("Term:", rf.term, "Status:", rf.status, "Id", rf.me, "Enter MianRoutine")
+		rf.mux.Unlock()
 
 		select {
 		case <-electTimeOut.C: // The current election timeout
 			electTimeOut.Stop()
 
 			rf.mux.Lock()
-			rf.logger.Println("Term:", rf.term, "Status:", rf.status, "Num", len(rf.peers), "Current election timeout")
-			if rf.status == Candidate && rf.term != 0 {
+			rf.logger.Println("Term:", rf.term, "Status:", rf.status, "Id", rf.me, "Current election timeout")
+			rf.logger.Println("Votedfor:", rf.votedFor)
+			if rf.votedFor != -1 {
+				continue
+			}
+			if rf.status == Candidate {
 				// election timeout elapses: start new election
-				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Start new election")
+				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Id", rf.me, "Start new election")
 				rf.electTimeOut <- true
 			}
 			rf.status = Candidate
@@ -427,10 +540,11 @@ func (rf *Raft) mainRoutine() {
 			electTimeOut.Stop()
 
 			rf.mux.Lock()
-			rf.logger.Println("Term", rf.term, "Status:", rf.status, "Send heartbeat")
-			if rf.status == Candidate && appendEntry.Term >= rf.term {
+			rf.votedFor = -1
+			rf.logger.Println("Term", rf.term, "Status:", rf.status, "Id", rf.me, "Response heartbeat")
+			if (rf.status == Leader || rf.status == Candidate) && appendEntry.Term >= rf.term {
 				// AppendEntries RPC received from new leader: convert to follower
-				rf.logger.Panicln("Term", rf.term, "Status:", rf.status, "Convert to follower")
+				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Convert to follower")
 				rf.status = Follower
 				rf.electTimeOut <- true
 			}
@@ -442,83 +556,10 @@ func (rf *Raft) mainRoutine() {
 		case <-rf.beVoted: // Convert to leader and call leader routine
 			electTimeOut.Stop()
 			rf.mux.Lock()
+			rf.logger.Println("Enter leader routine")
 			rf.status = Leader
 			rf.mux.Unlock()
 			rf.leaderRoutine()
 		}
-	}
-}
-
-func (rf *Raft) sendRequestVoteRoutine(
-	server int, args *RequestVoteArgs, reply *RequestVoteReply, replies chan *RequestVoteReply) {
-	rf.sendRequestVote(server, args, reply)
-	replies <- reply // send reply through channel
-}
-
-func (rf *Raft) electionRoutine() {
-	args := &RequestVoteArgs{
-		rf.term,
-		rf.me,
-	}
-
-	// send initial empty AppendEntries RPCs (heartbeat) to each server;
-	// repeat during idle periods to prevent election timeouts
-	count := 1
-	replies := make(chan *RequestVoteReply, len(rf.peers))
-	for peer := 0; peer < len(rf.peers); peer++ {
-		if peer != rf.me {
-			var reply RequestVoteReply
-			go rf.sendRequestVoteRoutine(peer, args, &reply, replies)
-		}
-	}
-
-	majority := len(rf.peers) / 2
-	for {
-		select {
-		case <-rf.electTimeOut: // election timeout, just stop thisb routine
-			return
-		case reply := <-replies: // gather replies from other servers
-			if reply.Term > rf.term { // term mismatch, convert to follower and return
-				rf.mux.Lock()
-				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Convert to follower")
-				rf.status = Follower
-				rf.term = reply.Term
-				rf.mux.Unlock()
-				return
-			}
-
-			// if satisfied majority vote, convert to leader and return
-			if count >= majority {
-				rf.mux.Lock()
-				rf.logger.Println("Term", rf.term, "Status:", rf.status, "Get majority")
-				rf.beVoted <- true
-				rf.mux.Unlock()
-				return
-			}
-
-			// update vote counts
-			if reply.VoteGranted {
-				count += 1
-			}
-		}
-	}
-}
-
-func (rf *Raft) leaderRoutine() {
-	args := &AppendEntriesArgs{
-		rf.term,
-		rf.me,
-		0,
-	}
-
-	for {
-		for peer := 0; peer < len(rf.peers); peer++ {
-			if peer != rf.me {
-				var reply AppendEntriesReply
-				go rf.sendAppendEntries(peer, args, &reply)
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }

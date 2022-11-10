@@ -1,15 +1,19 @@
 package raft
 
-import "github.com/cmu440/rpc"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import crand "crypto/rand"
-import "encoding/base64"
-import "sync/atomic"
-import "time"
-import "fmt"
+import (
+	"log"
+	"runtime"
+	"sync"
+	"testing"
+
+	"github.com/cmu440/rpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
 
 //
 // Raft tests.
@@ -57,6 +61,51 @@ func TestReElection2A(t *testing.T) {
 	// a new leader should be elected
 	fmt.Printf("Checking for a new leader\n")
 	cfg.checkOneLeader()
+
+	fmt.Printf("======================= END =======================\n\n")
+}
+
+func TestMyTest_TestSmallPartition(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 6
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test (2A): Re-election\n")
+	fmt.Printf("Basic 1 leader\n")
+	leader1 := cfg.checkOneLeader()
+	fmt.Println("Leader is ", leader1)
+
+	var Partition1 IntSet
+	Partition1 = make(map[int]struct{})
+	Partition1[0] = struct{}{}
+	Partition1[1] = struct{}{}
+	Partition1[2] = struct{}{}
+	Partition1[3] = struct{}{}
+
+	var Partition2 IntSet
+	Partition2 = make(map[int]struct{})
+	Partition2[5] = struct{}{}
+	Partition2[4] = struct{}{}
+
+	cfg.disconnect_partition(Partition2)
+
+	leader1 = cfg.checkLeaderInPartition(Partition1)
+
+	fmt.Println("In Partition1 Leader is ", leader1)
+
+	leader2 := cfg.checkLeaderInPartition(Partition2)
+
+	fmt.Println("In Partition2 Leader is ", leader2)
+
+	cfg.connect_partition(Partition2)
+	fmt.Println("Reconnection")
+
+	leader1 = cfg.checkLeaderInPartition(Partition1)
+
+	fmt.Println("After reconnection Leader is ", leader1)
+
+	cfg.checkTerms()
 
 	fmt.Printf("======================= END =======================\n\n")
 }
